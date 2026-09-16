@@ -1,0 +1,193 @@
+name: blue-green-multitenant-lab
+
+x-app-image: &app-image
+  build: .
+
+x-labels: &common-labels
+  project: blue-green-multitenant-lab
+  purpose: upwork-mvp-demo
+
+services:
+  # ---- Data tier: one Postgres per color, per the brief. Green tracks
+  # blue via logical replication (db/replication/setup.sh) so the cutover
+  # script can gate on replication lag instead of on stale demo data.
+  db-blue:
+    image: postgres:16-alpine
+    command: ["postgres", "-c", "wal_level=logical", "-c", "max_replication_slots=5", "-c", "max_wal_senders=5"]
+    environment:
+      POSTGRES_DB: appdb
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres_pw
+    volumes:
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+      - db-blue-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d appdb"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+    labels:
+      <<: *common-labels
+      component: database
+      color: blue
+
+  db-green:
+    image: postgres:16-alpine
+    command: ["postgres", "-c", "wal_level=logical", "-c", "max_replication_slots=5", "-c", "max_wal_senders=5"]
+    environment:
+      POSTGRES_DB: appdb
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres_pw
+    volumes:
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+      - db-green-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d appdb"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+    labels:
+      <<: *common-labels
+      component: database
+      color: green
+
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+    labels:
+      <<: *common-labels
+      component: job-queue-broker
+
+  oidc:
+    <<: *app-image
+    command: ["uvicorn", "app.oidc_provider:app", "--host", "0.0.0.0", "--port", "9000"]
+    environment:
+      APP_COLOR: shared
+    ports:
+      # Published so the load generator and demo/test scripts on the host
+      # can mint tokens directly, mirroring how a real client talks to an
+      # external IdP (Auth0/Clerk) rather than through the app's own router.
+      - "9000:9000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/.well-known/jwks.json"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+    labels:
+      <<: *common-labels
+      component: mock-oidc-provider
+
+  # ---- Blue stack
+  app-blue:
+    <<: *app-image
+    environment:
+      APP_COLOR: blue
+      APP_VERSION: "1.0.0"
+      DATABASE_URL: postgresql+psycopg2://app_user:app_pw@db-blue:5432/appdb
+      REDIS_URL: redis://redis:6379/0
+      OIDC_ISSUER: http://oidc:9000
+      OIDC_INTERNAL_URL: http://oidc:9000
+      TEST_APP_URL: http://localhost:8000
+      TEST_OIDC_URL: http://oidc:9000
+      TEST_DB_DSN: postgresql://app_user:app_pw@db-blue:5432/appdb
+    volumes:
+      # tests/ is not baked into the image (see Dockerfile) -- mounted so
+      # `make test` (docker compose exec app-blue pytest) can run against
+      # the live stack without a separate test image.
+      - ./tests:/srv/tests:ro
+    depends_on:
+      db-blue: {condition: service_healthy}
+      redis: {condition: service_healthy}
+      oidc: {condition: service_healthy}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/healthz"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+    labels:
+      <<: *common-labels
+      component: app
+      color: blue
+
+  worker-blue:
+    <<: *app-image
+    command: ["python", "-m", "worker.run_worker"]
+    environment:
+      APP_COLOR: blue
+      DATABASE_URL: postgresql+psycopg2://app_user:app_pw@db-blue:5432/appdb
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      db-blue: {condition: service_healthy}
+      redis: {condition: service_healthy}
+    deploy:
+      replicas: 2
+    labels:
+      <<: *common-labels
+      component: worker
+      color: blue
+
+  # ---- Green stack (identical image/config shape to blue; only color+DB differ)
+  app-green:
+    <<: *app-image
+    environment:
+      APP_COLOR: green
+      APP_VERSION: "1.1.0"
+      DATABASE_URL: postgresql+psycopg2://app_user:app_pw@db-green:5432/appdb
+      REDIS_URL: redis://redis:6379/0
+      OIDC_ISSUER: http://oidc:9000
+      OIDC_INTERNAL_URL: http://oidc:9000
+    depends_on:
+      db-green: {condition: service_healthy}
+      redis: {condition: service_healthy}
+      oidc: {condition: service_healthy}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/healthz"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+    labels:
+      <<: *common-labels
+      component: app
+      color: green
+
+  worker-green:
+    <<: *app-image
+    command: ["python", "-m", "worker.run_worker"]
+    environment:
+      APP_COLOR: green
+      DATABASE_URL: postgresql+psycopg2://app_user:app_pw@db-green:5432/appdb
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      db-green: {condition: service_healthy}
+      redis: {condition: service_healthy}
+    deploy:
+      replicas: 2
+    labels:
+      <<: *common-labels
+      component: worker
+      color: green
+
+  # ---- Router: the only entrypoint a client ever talks to. Traffic split
+  # between app-blue/app-green is a weighted upstream, rewritten and
+  # reloaded in place by scripts/cutover.sh -- never by restarting the
+  # container, so existing connections drain instead of being killed.
+  router:
+    image: nginx:1.27-alpine
+    volumes:
+      - ./router/nginx.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "8080:80"
+    depends_on:
+      app-blue: {condition: service_healthy}
+      app-green: {condition: service_healthy}
+    labels:
+      <<: *common-labels
+      component: router
+
+volumes:
+  db-blue-data:
+  db-green-data:

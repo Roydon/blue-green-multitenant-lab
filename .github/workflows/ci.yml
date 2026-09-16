@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+jobs:
+  test-and-demo:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install host tooling (load generator, helper scripts)
+        run: pip install -r requirements.txt
+
+      - name: Run isolation and RBAC tests
+        run: make test
+
+      - name: Tear down before the demo (fresh volumes)
+        run: make down
+
+      - name: Run the full blue/green cutover demo
+        run: make demo
+
+      - name: Upload load generator results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: demo-output
+          path: demo-output/
+          if-no-files-found: ignore
+
+      - name: Show service logs on failure
+        if: failure()
+        run: docker compose logs --tail=200

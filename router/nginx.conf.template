@@ -1,0 +1,22 @@
+worker_processes auto;
+events { worker_connections 1024; }
+
+http {
+    upstream backend {
+        __UPSTREAM_SERVERS__
+    }
+
+    server {
+        listen 80;
+
+        location /healthz {
+            proxy_pass http://backend/healthz;
+        }
+
+        location / {
+            proxy_pass http://backend;
+            proxy_set_header Host $host;
+            proxy_read_timeout 10s;
+        }
+    }
+}
